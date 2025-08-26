@@ -408,6 +408,7 @@ async def parse_pdf(
         return JSONResponse(
             status_code=200,
             content={
+                "status_code":200,
                 "backend": backend,
                 "version": __version__,
                 "results": result_dict
@@ -417,7 +418,7 @@ async def parse_pdf(
         logger.exception(e)
         return JSONResponse(
             status_code=500,
-            content={"error": f"Failed to process file: {str(e)}"}
+            content={"status_code":500,"error": f"Failed to process file: {str(e)}"}
         )
 
 

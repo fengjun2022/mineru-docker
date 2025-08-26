@@ -1,0 +1,121 @@
+services:
+  mineru-sglang-server:
+    image: mineru-sglang:latest
+    container_name: mineru-sglang-server
+    restart: always
+    profiles: ["sglang-server"]
+    ports:
+      - 30000:30000
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-sglang-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+      # --enable-torch-compile  # You can also enable torch.compile to accelerate inference speed by approximately 15%
+      # --dp-size 2  # If using multiple GPUs, increase throughput using sglang's multi-GPU parallel mode
+      # --tp-size 2  # If you have more than one GPU, you can expand available VRAM using tensor parallelism (TP) mode.
+      # --mem-fraction-static 0.5  # If running on a single GPU and encountering VRAM shortage, reduce the KV cache size by this parameter, if VRAM issues persist, try lowering it further to `0.4` or below.
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+  mineru-api:
+    image: mineru-sglang:latest
+    container_name: mineru-api
+    restart: always
+    profiles: ["api"]
+    ports:
+      - 18000:8000
+    environment:
+      MINERU_MODEL_SOURCE: local
+      MINERU_BASE_URL: http://139.196.53.82:2002/file_mineru/output
+    volumes:
+      # 挂载修改后的 FastAPI 文件
+      - ./fast_api.py:/usr/local/lib/python3.10/dist-packages/mineru/cli/fast_api.py
+      # 挂载 RunLLM Widget 相关文件到容器内 (使用相对路径)
+      - ./react-18.3.1.esm.js:/sgl-workspace/sglang/docs/react-18.3.1.esm.js:ro
+      - ./react-dom-18.3.1.esm.js:/sgl-workspace/sglang/docs/react-dom-18.3.1.esm.js:ro
+      - ./widget-main.js:/sgl-workspace/sglang/docs/widget-main.js:ro
+      - ./main-My2jJ2eg.js:/sgl-workspace/sglang/docs/main-My2jJ2eg.js:ro
+      - ./wrap_run_llm.py:/sgl-workspace/sglang/docs/wrap_run_llm.py:ro
+      # 挂载 Swagger UI 文件
+      - ./swagger-ui.css:/sgl-workspace/sglang/docs/swagger-ui.css:ro
+      - ./swagger-ui-bundle.js:/sgl-workspace/sglang/docs/swagger-ui-bundle.js:ro
+      - ./output:/home/output
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      # parameters for sglang-engine
+      # --enable-torch-compile  # You can also enable torch.compile to accelerate inference speed by approximately 15%
+      # --dp-size 2  # If using multiple GPUs, increase throughput using sglang's multi-GPU parallel mode
+      # --tp-size 2  # If you have more than one GPU, you can expand available VRAM using tensor parallelism (TP) mode.
+      # --mem-fraction-static 0.5  # If running on a single GPU and encountering VRAM shortage, reduce the KV cache size by this parameter, if VRAM issues persist, try lowering it further to `0.4` or below.
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ "0" ]
+              capabilities: [ gpu ]
+    # 新增 Nginx 代理服务
+  mineru-nginx-api:
+      image: nginx:alpine
+      container_name: mineru-nginx
+      restart: always
+      profiles: [ "api" ]  # 可以在api profile下一起启动
+      ports:
+        - 12901:80
+      volumes:
+        - ./output:/usr/share/nginx/html/mineru/output
+        - ./nginx.conf:/etc/nginx/nginx.conf:ro  # 挂载nginx配置文件
+      depends_on:
+        - mineru-api
+
+  # 定义共享卷
+  mineru-gradio:
+    image: mineru-sglang:latest
+    container_name: mineru-gradio
+    restart: always
+    profiles: ["gradio"]
+    ports:
+      - 7860:7860
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-gradio
+    command:
+      --server-name 0.0.0.0
+      --server-port 7860
+      --enable-sglang-engine true  # Enable the sglang engine for Gradio
+      # --enable-api false  # If you want to disable the API, set this to false
+      # --max-convert-pages 20  # If you want to limit the number of pages for conversion, set this to a specific number
+      # parameters for sglang-engine
+      # --enable-torch-compile  # You can also enable torch.compile to accelerate inference speed by approximately 15%
+      # --dp-size 2  # If using multiple GPUs, increase throughput using sglang's multi-GPU parallel mode
+      # --tp-size 2  # If you have more than one GPU, you can expand available VRAM using tensor parallelism (TP) mode.
+      # --mem-fraction-static 0.5  # If running on a single GPU and encountering VRAM shortage, reduce the KV cache size by this parameter, if VRAM issues persist, try lowering it further to `0.4` or below.
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: [ "0" ]
+              capabilities: [ gpu ]

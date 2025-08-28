@@ -1,3 +1,4 @@
+import json
 import uuid
 import os
 import uvicorn
@@ -21,7 +22,11 @@ from datetime import datetime
 from mineru.cli.common import aio_do_parse, read_fn, pdf_suffixes, image_suffixes
 from mineru.utils.cli_parser import arg_parse
 from mineru.version import __version__
-
+import hashlib
+import os
+from pathlib import Path
+from typing import List, Optional
+from glob import glob
 
 # 文件清理管理器类
 class FileCleanupManager:
@@ -243,13 +248,14 @@ async def parse_pdf(
         return_middle_json: bool = Form(False),
         return_model_output: bool = Form(False),
         return_content_list: bool = Form(True),
+        return_tree_structure: bool = Form(True),  # 新增参数：是否返回树形结构
         return_images: bool = Form(False),
-        draw_layout_bbox: bool = Form(True),  # 新增参数：是否绘制布局边界框
-        draw_span_bbox: bool = Form(True),  # 新增参数：是否绘制span边界框
-        dump_orig_pdf: bool = Form(True),  # 新增参数：是否输出原始PDF
+        draw_layout_bbox: bool = Form(True),
+        draw_span_bbox: bool = Form(True),
+        dump_orig_pdf: bool = Form(True),
         start_page_id: int = Form(0),
         end_page_id: int = Form(99999),
-        base_url: Optional[str] = Form(None),  # 基础URL参数，可选
+        base_url: Optional[str] = Form(None),
 ):
     # 获取命令行配置参数
     config = getattr(app.state, "config", {})
@@ -262,117 +268,150 @@ async def parse_pdf(
         base_url = os.getenv('MINERU_BASE_URL', 'http://localhost:12901/file_mineru/output')
 
     try:
-        # 生成一个UUID作为文件名前缀
-        file_uuid = str(uuid.uuid4())
-
-        # 直接在输出目录创建文件，不创建子目录
+        # 确保输出目录存在
         os.makedirs(output_dir, exist_ok=True)
 
         # 处理上传的PDF文件
         pdf_file_names = []
         pdf_bytes_list = []
-        original_filenames = []  # 存储原始文件名
+        original_filenames = []
+        files_to_process = []
 
         for file in files:
             content = await file.read()
             file_path = Path(file.filename)
 
-            # 如果是图像文件或PDF，使用read_fn处理
-            if file_path.suffix.lower() in pdf_suffixes + image_suffixes:
-                # 直接使用UUID作为文件名，不带原始文件名
-                new_filename = file_uuid
-                temp_path = Path(output_dir) / file_path.name
+            # 检查文件类型
+            if file_path.suffix.lower() not in pdf_suffixes + image_suffixes:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Unsupported file type: {file_path.suffix}"}
+                )
 
-                with open(temp_path, "wb") as f:
-                    f.write(content)
+            # 计算文件内容的MD5值
+            file_md5 = hashlib.md5(content).hexdigest()
 
+            # 检查是否已经存在处理结果
+            if backend.startswith("pipeline"):
+                result_dir = os.path.join(output_dir, file_md5, parse_method)
+            else:
+                result_dir = os.path.join(output_dir, file_md5, "vlm")
+
+            # 检查结果文件是否已存在（以markdown文件为标志）
+            md_file_path = os.path.join(result_dir, f"{file_md5}.md")
+            file_already_processed = os.path.exists(md_file_path)
+
+            pdf_file_names.append(file_md5)
+            original_filenames.append(file.filename)
+
+            if not file_already_processed:
+                # 文件未处理过，需要加入处理队列
                 try:
+                    # 创建临时文件用于处理
+                    temp_path = Path(output_dir) / file_path.name
+                    with open(temp_path, "wb") as f:
+                        f.write(content)
+
                     pdf_bytes = read_fn(temp_path)
                     pdf_bytes_list.append(pdf_bytes)
-                    pdf_file_names.append(new_filename)  # 使用新的文件名
-                    original_filenames.append(file.filename)  # 保存原始文件名
+                    files_to_process.append(file_md5)
                     os.remove(temp_path)  # 删除临时文件
                 except Exception as e:
                     return JSONResponse(
                         status_code=400,
                         content={"error": f"Failed to load file: {str(e)}"}
                     )
-            else:
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": f"Unsupported file type: {file_path.suffix}"}
-                )
 
-        # 设置语言列表，确保与文件数量一致
-        actual_lang_list = lang_list
-        if len(actual_lang_list) != len(pdf_file_names):
-            # 如果语言列表长度不匹配，使用第一个语言或默认"ch"
-            actual_lang_list = [actual_lang_list[0] if actual_lang_list else "ch"] * len(pdf_file_names)
+        # 只有当有新文件需要处理时才调用处理函数
+        if files_to_process:
+            # 设置语言列表，确保与待处理文件数量一致
+            actual_lang_list = lang_list
+            if len(actual_lang_list) != len(files_to_process):
+                actual_lang_list = [actual_lang_list[0] if actual_lang_list else "ch"] * len(files_to_process)
 
-        # 调用异步处理函数
-        await aio_do_parse(
-            output_dir=output_dir,  # 直接使用输出目录，不使用子目录
-            pdf_file_names=pdf_file_names,
-            pdf_bytes_list=pdf_bytes_list,
-            p_lang_list=actual_lang_list,
-            backend=backend,
-            parse_method=parse_method,
-            formula_enable=formula_enable,
-            table_enable=table_enable,
-            server_url=server_url,
-            f_draw_layout_bbox=draw_layout_bbox,  # 使用参数
-            f_draw_span_bbox=draw_span_bbox,  # 使用参数
-            f_dump_md=return_md,
-            f_dump_middle_json=return_middle_json,
-            f_dump_model_output=return_model_output,
-            f_dump_orig_pdf=dump_orig_pdf,  # 使用参数
-            f_dump_content_list=return_content_list,
-            start_page_id=start_page_id,
-            end_page_id=end_page_id,
-            **config
-        )
+            # 调用异步处理函数（只处理新文件）
+            await aio_do_parse(
+                output_dir=output_dir,
+                pdf_file_names=files_to_process,
+                pdf_bytes_list=pdf_bytes_list,
+                p_lang_list=actual_lang_list,
+                backend=backend,
+                parse_method=parse_method,
+                formula_enable=formula_enable,
+                table_enable=table_enable,
+                server_url=server_url,
+                f_draw_layout_bbox=draw_layout_bbox,
+                f_draw_span_bbox=draw_span_bbox,
+                f_dump_md=return_md,
+                f_dump_middle_json=return_middle_json,
+                f_dump_model_output=return_model_output,
+                f_dump_orig_pdf=dump_orig_pdf,
+                f_dump_content_list=return_content_list,
+                start_page_id=start_page_id,
+                end_page_id=end_page_id,
+                **config
+            )
 
-        # 构建结果路径 - 返回链接而不是内容
+            # 处理新解析的文件，生成树形结构
+            if return_tree_structure:
+                for file_md5 in files_to_process:
+                    await generate_tree_structure(output_dir, file_md5, backend, parse_method)
+
+        # 为所有文件（包括缓存的）生成树形结构（如果需要且不存在）
+        if return_tree_structure:
+            for file_md5 in pdf_file_names:
+                if file_md5 not in files_to_process:  # 对于缓存的文件
+                    tree_file_path = get_tree_file_path(output_dir, file_md5, backend, parse_method)
+                    if not os.path.exists(tree_file_path):
+                        await generate_tree_structure(output_dir, file_md5, backend, parse_method)
+
+        # 构建结果路径 - 返回链接（包括已存在的和新处理的）
         result_dict = {}
-        for i, pdf_name in enumerate(pdf_file_names):
+        for i, file_md5 in enumerate(pdf_file_names):
             # 使用固定的英文单词作为键
             result_dict["document"] = {}
             data = result_dict["document"]
 
-            # 添加原始文件名和UUID
+            # 添加原始文件名和MD5
             data["original_filename"] = original_filenames[i]
-            data["file_uuid"] = pdf_name  # 实际的UUID文件名
+            data["file_md5"] = file_md5
 
             if backend.startswith("pipeline"):
-                parse_dir = os.path.join(output_dir, pdf_name, parse_method)
-                relative_path = f"{pdf_name}/{parse_method}"
+                parse_dir = os.path.join(output_dir, file_md5, parse_method)
+                relative_path = f"{file_md5}/{parse_method}"
             else:
-                parse_dir = os.path.join(output_dir, pdf_name, "vlm")
-                relative_path = f"{pdf_name}/vlm"
+                parse_dir = os.path.join(output_dir, file_md5, "vlm")
+                relative_path = f"{file_md5}/vlm"
 
             if os.path.exists(parse_dir):
                 if return_md:
-                    md_file = f"{pdf_name}.md"
+                    md_file = f"{file_md5}.md"
                     if os.path.exists(os.path.join(parse_dir, md_file)):
                         data["md_url"] = f"{base_url.rstrip('/')}/{relative_path}/{md_file}"
 
                 if return_middle_json:
-                    middle_file = f"{pdf_name}_middle.json"
+                    middle_file = f"{file_md5}_middle.json"
                     if os.path.exists(os.path.join(parse_dir, middle_file)):
                         data["middle_json_url"] = f"{base_url.rstrip('/')}/{relative_path}/{middle_file}"
 
                 if return_model_output:
                     if backend.startswith("pipeline"):
-                        model_file = f"{pdf_name}_model.json"
+                        model_file = f"{file_md5}_model.json"
                     else:
-                        model_file = f"{pdf_name}_model_output.txt"
+                        model_file = f"{file_md5}_model_output.txt"
                     if os.path.exists(os.path.join(parse_dir, model_file)):
                         data["model_output_url"] = f"{base_url.rstrip('/')}/{relative_path}/{model_file}"
 
                 if return_content_list:
-                    content_file = f"{pdf_name}_content_list.json"
+                    content_file = f"{file_md5}_content_list.json"
                     if os.path.exists(os.path.join(parse_dir, content_file)):
                         data["content_list_url"] = f"{base_url.rstrip('/')}/{relative_path}/{content_file}"
+
+                # 新增：返回树形结构文件
+                if return_tree_structure:
+                    tree_file = f"{file_md5}_tree_structure.json"
+                    if os.path.exists(os.path.join(parse_dir, tree_file)):
+                        data["tree_structure_url"] = f"{base_url.rstrip('/')}/{relative_path}/{tree_file}"
 
                 if return_images:
                     images_dir = os.path.join(parse_dir, "images")
@@ -389,39 +428,179 @@ async def parse_pdf(
 
                 # 添加原始PDF文件链接
                 if dump_orig_pdf:
-                    orig_pdf_file = f"{pdf_name}_origin.pdf"
+                    orig_pdf_file = f"{file_md5}_origin.pdf"
                     if os.path.exists(os.path.join(parse_dir, orig_pdf_file)):
                         data["orig_pdf_url"] = f"{base_url.rstrip('/')}/{relative_path}/{orig_pdf_file}"
 
                 # 添加布局边界框PDF链接
                 if draw_layout_bbox:
-                    layout_pdf_file = f"{pdf_name}_layout.pdf"
+                    layout_pdf_file = f"{file_md5}_layout.pdf"
                     if os.path.exists(os.path.join(parse_dir, layout_pdf_file)):
                         data["layout_pdf_url"] = f"{base_url.rstrip('/')}/{relative_path}/{layout_pdf_file}"
 
                 # 添加span边界框PDF链接
                 if draw_span_bbox:
-                    span_pdf_file = f"{pdf_name}_span.pdf"
+                    span_pdf_file = f"{file_md5}_span.pdf"
                     if os.path.exists(os.path.join(parse_dir, span_pdf_file)):
                         data["span_pdf_url"] = f"{base_url.rstrip('/')}/{relative_path}/{span_pdf_file}"
 
         return JSONResponse(
             status_code=200,
             content={
-                "status_code":200,
+                "status_code": 200,
                 "backend": backend,
                 "version": __version__,
-                "results": result_dict
+                "results": result_dict,
+                "processed_files": len(files_to_process),
+                "total_files": len(pdf_file_names),
+                "cached_files": len(pdf_file_names) - len(files_to_process)
             }
         )
     except Exception as e:
         logger.exception(e)
         return JSONResponse(
             status_code=500,
-            content={"status_code":500,"error": f"Failed to process file: {str(e)}"}
+            content={"status_code": 500, "error": f"Failed to process file: {str(e)}"}
         )
 
 
+async def generate_tree_structure(output_dir: str, file_md5: str, backend: str, parse_method: str):
+    """
+    根据content_list.json生成树形结构文件
+    """
+    try:
+        # 确定解析目录
+        if backend.startswith("pipeline"):
+            parse_dir = os.path.join(output_dir, file_md5, parse_method)
+        else:
+            parse_dir = os.path.join(output_dir, file_md5, "vlm")
+
+        # content_list.json文件路径
+        content_file = os.path.join(parse_dir, f"{file_md5}_content_list.json")
+
+        if not os.path.exists(content_file):
+            logger.warning(f"Content list file not found: {content_file}")
+            return
+
+        # 读取content_list.json
+        with open(content_file, 'r', encoding='utf-8') as f:
+            content_data = json.load(f)
+
+        # 调用Java服务处理树形结构（假设有Java服务）
+        tree_data = await process_content_to_tree(content_data)
+
+        # 保存树形结构文件
+        tree_file = os.path.join(parse_dir, f"{file_md5}_tree_structure.json")
+        with open(tree_file, 'w', encoding='utf-8') as f:
+            json.dump(tree_data, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Tree structure generated: {tree_file}")
+
+    except Exception as e:
+        logger.error(f"Failed to generate tree structure for {file_md5}: {str(e)}")
+
+
+async def process_content_to_tree(content_data: list) -> dict:
+    """
+    将content_list数据转换为树形结构
+    这里模拟你的Java PdfTreeProcessor的处理逻辑
+    """
+    try:
+        result = []
+        node_stack = []
+        chunk_counter = 1
+
+        for item in content_data:
+            if item.get("type") == "text" and item.get("text_level", 0) > 0:
+                # 处理标题项
+                current_level = item.get("text_level")
+
+                # 弹出比当前级别高或相等的节点
+                while node_stack and node_stack[-1].get("text_level", 0) >= current_level:
+                    node_stack.pop()
+
+                # 构建section_path
+                section_path = []
+                for node in node_stack:
+                    if node.get("section_path"):
+                        section_path.extend(node["section_path"])
+                section_path.append(item.get("text", ""))
+
+                # 创建新节点
+                new_node = {
+                    "chunk_id": f"c{chunk_counter:04d}",
+                    "section_path": section_path,
+                    "text_level": current_level,
+                    "pages": [item.get("page_idx", 0)],
+                    "children": []
+                }
+
+                # 添加到父节点或根节点
+                if not node_stack:
+                    result.append(new_node)
+                else:
+                    parent = node_stack[-1]
+                    parent["children"].append(new_node)
+                    # 更新父节点页码
+                    if item.get("page_idx") not in parent.get("pages", []):
+                        parent["pages"].append(item.get("page_idx"))
+
+                node_stack.append(new_node)
+                chunk_counter += 1
+
+            else:
+                # 处理内容项
+                if not node_stack:
+                    # 创建默认根节点
+                    default_node = {
+                        "chunk_id": "c0000",
+                        "section_path": ["未分类内容"],
+                        "text_level": 1,
+                        "pages": [item.get("page_idx", 0)],
+                        "children": [item]
+                    }
+                    result.append(default_node)
+                else:
+                    # 添加到当前最深层节点
+                    current_node = node_stack[-1]
+                    current_node["children"].append(item)
+                    # 更新页码
+                    if item.get("page_idx") not in current_node.get("pages", []):
+                        current_node["pages"].append(item.get("page_idx"))
+                        # 更新祖先节点页码
+                        for node in node_stack:
+                            if item.get("page_idx") not in node.get("pages", []):
+                                node["pages"].append(item.get("page_idx"))
+
+        # 排序页码
+        def sort_pages(nodes):
+            for node in nodes:
+                if isinstance(node, dict) and "pages" in node:
+                    node["pages"].sort()
+                    if "children" in node:
+                        child_tree_nodes = [child for child in node["children"] if
+                                            isinstance(child, dict) and "chunk_id" in child]
+                        if child_tree_nodes:
+                            sort_pages(child_tree_nodes)
+
+        sort_pages(result)
+        return result
+
+    except Exception as e:
+        logger.error(f"Error processing content to tree: {str(e)}")
+        return []
+
+
+def get_tree_file_path(output_dir: str, file_md5: str, backend: str, parse_method: str) -> str:
+    """
+    获取树形结构文件路径
+    """
+    if backend.startswith("pipeline"):
+        parse_dir = os.path.join(output_dir, file_md5, parse_method)
+    else:
+        parse_dir = os.path.join(output_dir, file_md5, "vlm")
+
+    return os.path.join(parse_dir, f"{file_md5}_tree_structure.json")
 # 添加清理相关的API端点
 @app.get("/cleanup")
 async def manual_cleanup_endpoint():

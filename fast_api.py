@@ -1,6 +1,10 @@
 import json
+import tempfile
 import uuid
 import os
+from urllib.parse import urlparse
+
+import aiohttp
 import uvicorn
 import click
 import asyncio
@@ -27,7 +31,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 from glob import glob
-
+from pydantic import BaseModel
 # 文件清理管理器类
 class FileCleanupManager:
     """文件清理管理器"""
@@ -235,33 +239,36 @@ def get_infer_result(file_suffix_identifier: str, pdf_name: str, parse_dir: str)
     return None
 
 
+
+# 定义请求模型
+class ParsePdfRequest(BaseModel):
+    file_url: Optional[str] = None
+    backend: str = "pipeline"
+    parse_method: str = "auto"
+    formula_enable: bool = True
+    table_enable: bool = True
+    server_url: Optional[str] = None
+    return_md: bool = True
+    return_middle_json: bool = False
+    return_model_output: bool = False
+    return_content_list: bool = True
+    return_tree_structure: bool = True
+    return_images: bool = False
+    draw_layout_bbox: bool = True
+    draw_span_bbox: bool = True
+    dump_orig_pdf: bool = True
+    start_page_id: int = 0
+    end_page_id: int = 99999
+    base_url: Optional[str] = None
+    lang: str = "ch"
+
 @app.post(path="/file_parse")
-async def parse_pdf(
-        files: List[UploadFile] = File(...),
-        backend: str = Form("pipeline"),
-        parse_method: str = Form("auto"),
-        formula_enable: bool = Form(True),
-        table_enable: bool = Form(True),
-        server_url: Optional[str] = Form(None),
-        return_md: bool = Form(True),
-        return_middle_json: bool = Form(False),
-        return_model_output: bool = Form(False),
-        return_content_list: bool = Form(True),
-        return_tree_structure: bool = Form(True),
-        return_images: bool = Form(False),
-        draw_layout_bbox: bool = Form(True),
-        draw_span_bbox: bool = Form(True),
-        dump_orig_pdf: bool = Form(True),
-        start_page_id: int = Form(0),
-        end_page_id: int = Form(99999),
-        base_url: Optional[str] = Form(None),
-        # 简化为单一语言参数
-        lang: str = Form("ch"),
-):
+async def parse_pdf(request: ParsePdfRequest):
     """
-    PDF解析接口，支持多语言文档
+    PDF解析接口，支持多语言文档和URL下载
 
     参数说明：
+    - file_url: 远程文件URL
     - lang: OCR语言 (ch=中文, japan=日文, en=英文, korean=韩文等)
 
     常用语言选择：
@@ -277,159 +284,262 @@ async def parse_pdf(
     output_dir = "/home/output"
 
     # 从环境变量获取基础URL
-    if base_url is None:
+    if request.base_url is None:
         base_url = os.getenv('MINERU_BASE_URL', 'http://localhost:12901/file_mineru/output')
+    else:
+        base_url = request.base_url
 
     # 验证语言代码
     supported_langs = ["ch", "en", "japan", "korean", "fr", "de", "es", "pt", "ru", "ar", "th", "vi", "it"]
-    if lang not in supported_langs:
+    if request.lang not in supported_langs:
         return JSONResponse(
             status_code=400,
-            content={"error": f"Unsupported language: {lang}. Supported: {supported_langs}"}
+            content={"error": f"Unsupported language: {request.lang}. Supported: {supported_langs}"}
+        )
+
+    # 验证必须提供file_url
+    if not request.file_url:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "file_url must be provided."}
         )
 
     try:
         # 确保输出目录存在
         os.makedirs(output_dir, exist_ok=True)
 
-        # 处理上传的PDF文件
+        # 处理PDF文件
         pdf_file_names = []
         pdf_bytes_list = []
         original_filenames = []
         files_to_process = []
 
-        for file in files:
-            content = await file.read()
-            file_path = Path(file.filename)
-
-            # 检查文件类型
-            if file_path.suffix.lower() not in pdf_suffixes + image_suffixes:
+        # ========== 处理URL下载 ==========
+        # 验证URL格式
+        try:
+            parsed_url = urlparse(request.file_url)
+            if not parsed_url.scheme in ['http', 'https']:
                 return JSONResponse(
                     status_code=400,
-                    content={"error": f"Unsupported file type: {file_path.suffix}"}
+                    content={"error": "Invalid URL scheme. Only http/https supported."}
+                )
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid URL format: {str(e)}"}
+            )
+
+        temp_path = None
+        max_retries = 3
+        retry_count = 0
+
+        # 重试机制
+        while retry_count < max_retries:
+            try:
+                retry_count += 1
+                if retry_count > 1:
+                    logger.info(f"Retry attempt {retry_count}/{max_retries} for URL: {request.file_url}")
+                    await asyncio.sleep(2 ** (retry_count - 1))
+
+                # 下载文件(设置300秒超时)
+                timeout = aiohttp.ClientTimeout(
+                    total=300,
+                    connect=30,
+                    sock_connect=30,
+                    sock_read=60
                 )
 
-            # 计算文件内容的MD5值
-            file_md5 = hashlib.md5(content).hexdigest()
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(request.file_url) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
 
-            # 检查是否已经存在处理结果
-            if backend.startswith("pipeline"):
-                result_dir = os.path.join(output_dir, file_md5, parse_method)
-            else:
-                result_dir = os.path.join(output_dir, file_md5, "vlm")
+                        content_length = resp.headers.get('Content-Length')
+                        if content_length and int(content_length) > 100 * 1024 * 1024:  # 100MB
+                            return JSONResponse(
+                                status_code=400,
+                                content={"error": "File too large (max 100MB)"}
+                            )
 
-            # 检查结果文件是否已存在
-            md_file_path = os.path.join(result_dir, f"{file_md5}.md")
-            file_already_processed = os.path.exists(md_file_path)
+                        content = await resp.read()
 
-            pdf_file_names.append(file_md5)
-            original_filenames.append(file.filename)
+                # 解析文件名
+                filename = os.path.basename(parsed_url.path)
+                if not filename:
+                    filename = f"download_{uuid.uuid4().hex}.pdf"
 
-            if not file_already_processed:
-                try:
-                    # 创建临时文件用于处理
-                    temp_path = Path(output_dir) / file_path.name
-                    with open(temp_path, "wb") as f:
-                        f.write(content)
+                file_path = Path(filename)
+
+                # 检查文件类型
+                if file_path.suffix.lower() not in pdf_suffixes + image_suffixes:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": f"Unsupported file type: {file_path.suffix}"}
+                    )
+
+                # 计算文件内容的MD5值
+                file_md5 = hashlib.md5(content).hexdigest()
+
+                # 检查是否已经存在处理结果
+                if request.backend.startswith("pipeline"):
+                    result_dir = os.path.join(output_dir, file_md5, request.parse_method)
+                else:
+                    result_dir = os.path.join(output_dir, file_md5, "vlm")
+
+                # 检查结果文件是否已存在
+                md_file_path = os.path.join(result_dir, f"{file_md5}.md")
+                file_already_processed = os.path.exists(md_file_path)
+
+                pdf_file_names.append(file_md5)
+                original_filenames.append(filename)
+
+                if not file_already_processed:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=file_path.suffix,
+                                                     dir=output_dir) as tmp_file:
+                        tmp_file.write(content)
+                        temp_path = tmp_file.name
 
                     pdf_bytes = read_fn(temp_path)
                     pdf_bytes_list.append(pdf_bytes)
                     files_to_process.append(file_md5)
-                    os.remove(temp_path)
-                except Exception as e:
+
+                logger.info(f"Successfully downloaded file from URL on attempt {retry_count}")
+                break
+
+            except asyncio.TimeoutError as e:
+                logger.warning(f"Download timeout (attempt {retry_count}/{max_retries}): {str(e)}")
+                if retry_count >= max_retries:
+                    return JSONResponse(
+                        status_code=408,
+                        content={
+                            "error": f"Failed to download file after {max_retries} attempts: Timeout",
+                            "details": str(e)
+                        }
+                    )
+                continue
+
+            except aiohttp.ClientError as e:
+                logger.warning(f"Network error (attempt {retry_count}/{max_retries}): {str(e)}")
+                if retry_count >= max_retries:
                     return JSONResponse(
                         status_code=400,
-                        content={"error": f"Failed to load file: {str(e)}"}
+                        content={
+                            "error": f"Failed to download file after {max_retries} attempts: Network error",
+                            "details": str(e)
+                        }
                     )
+                continue
 
-        # 处理新文件
+            except Exception as e:
+                logger.warning(f"Processing error (attempt {retry_count}/{max_retries}): {str(e)}")
+                if retry_count >= max_retries:
+                    return JSONResponse(
+                        status_code=500,
+                        content={
+                            "error": f"Failed to process file after {max_retries} attempts",
+                            "details": str(e)
+                        }
+                    )
+                continue
+
+            finally:
+                if temp_path and os.path.exists(temp_path) and retry_count >= max_retries:
+                    try:
+                        os.remove(temp_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp file: {e}")
+
+        # 最终清理临时文件
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception as e:
+                logger.warning(f"Failed to remove temp file: {e}")
+
+        # ========== 处理新文件 ==========
         if files_to_process:
-            # 为所有文件使用相同的语言
-            lang_list = [lang] * len(files_to_process)
+            lang_list = [request.lang] * len(files_to_process)
 
-            # 调用异步处理函数
             await aio_do_parse(
                 output_dir=output_dir,
                 pdf_file_names=files_to_process,
                 pdf_bytes_list=pdf_bytes_list,
                 p_lang_list=lang_list,
-                backend=backend,
-                parse_method=parse_method,
-                formula_enable=formula_enable,
-                table_enable=table_enable,
-                server_url=server_url,
-                f_draw_layout_bbox=draw_layout_bbox,
-                f_draw_span_bbox=draw_span_bbox,
-                f_dump_md=return_md,
-                f_dump_middle_json=return_middle_json,
-                f_dump_model_output=return_model_output,
-                f_dump_orig_pdf=dump_orig_pdf,
-                f_dump_content_list=return_content_list,
-                start_page_id=start_page_id,
-                end_page_id=end_page_id,
+                backend=request.backend,
+                parse_method=request.parse_method,
+                formula_enable=request.formula_enable,
+                table_enable=request.table_enable,
+                server_url=request.server_url,
+                f_draw_layout_bbox=request.draw_layout_bbox,
+                f_draw_span_bbox=request.draw_span_bbox,
+                f_dump_md=request.return_md,
+                f_dump_middle_json=request.return_middle_json,
+                f_dump_model_output=request.return_model_output,
+                f_dump_orig_pdf=request.dump_orig_pdf,
+                f_dump_content_list=request.return_content_list,
+                start_page_id=request.start_page_id,
+                end_page_id=request.end_page_id,
                 **config
             )
 
-            # 生成树形结构
-            if return_tree_structure:
+            if request.return_tree_structure:
                 for file_md5 in files_to_process:
-                    await generate_tree_structure(output_dir, file_md5, backend, parse_method)
+                    await generate_tree_structure(output_dir, file_md5, request.backend, request.parse_method)
 
-        # 为缓存文件生成树形结构（如果需要且不存在）
-        if return_tree_structure:
+        # ========== 为缓存文件生成树形结构 ==========
+        if request.return_tree_structure:
             for file_md5 in pdf_file_names:
                 if file_md5 not in files_to_process:
-                    tree_file_path = get_tree_file_path(output_dir, file_md5, backend, parse_method)
+                    tree_file_path = get_tree_file_path(output_dir, file_md5, request.backend, request.parse_method)
                     if not os.path.exists(tree_file_path):
-                        await generate_tree_structure(output_dir, file_md5, backend, parse_method)
+                        await generate_tree_structure(output_dir, file_md5, request.backend, request.parse_method)
 
-        # 构建结果路径
+        # ========== 构建结果路径 ==========
         result_dict = {}
         for i, file_md5 in enumerate(pdf_file_names):
             result_dict["document"] = {}
             data = result_dict["document"]
 
-            # 添加原始文件名和MD5
             data["original_filename"] = original_filenames[i]
             data["file_md5"] = file_md5
 
-            if backend.startswith("pipeline"):
-                parse_dir = os.path.join(output_dir, file_md5, parse_method)
-                relative_path = f"{file_md5}/{parse_method}"
+            if request.backend.startswith("pipeline"):
+                parse_dir = os.path.join(output_dir, file_md5, request.parse_method)
+                relative_path = f"{file_md5}/{request.parse_method}"
             else:
                 parse_dir = os.path.join(output_dir, file_md5, "vlm")
                 relative_path = f"{file_md5}/vlm"
 
             if os.path.exists(parse_dir):
-                if return_md:
+                if request.return_md:
                     md_file = f"{file_md5}.md"
                     if os.path.exists(os.path.join(parse_dir, md_file)):
                         data["md_url"] = f"{base_url.rstrip('/')}/{relative_path}/{md_file}"
 
-                if return_middle_json:
+                if request.return_middle_json:
                     middle_file = f"{file_md5}_middle.json"
                     if os.path.exists(os.path.join(parse_dir, middle_file)):
                         data["middle_json_url"] = f"{base_url.rstrip('/')}/{relative_path}/{middle_file}"
 
-                if return_model_output:
-                    if backend.startswith("pipeline"):
+                if request.return_model_output:
+                    if request.backend.startswith("pipeline"):
                         model_file = f"{file_md5}_model.json"
                     else:
                         model_file = f"{file_md5}_model_output.txt"
                     if os.path.exists(os.path.join(parse_dir, model_file)):
                         data["model_output_url"] = f"{base_url.rstrip('/')}/{relative_path}/{model_file}"
 
-                if return_content_list:
+                if request.return_content_list:
                     content_file = f"{file_md5}_content_list.json"
                     if os.path.exists(os.path.join(parse_dir, content_file)):
                         data["content_list_url"] = f"{base_url.rstrip('/')}/{relative_path}/{content_file}"
 
-                if return_tree_structure:
+                if request.return_tree_structure:
                     tree_file = f"{file_md5}_tree_structure.json"
                     if os.path.exists(os.path.join(parse_dir, tree_file)):
                         data["tree_structure_url"] = f"{base_url.rstrip('/')}/{relative_path}/{tree_file}"
 
-                if return_images:
+                if request.return_images:
                     images_dir = os.path.join(parse_dir, "images")
                     if os.path.exists(images_dir):
                         image_paths = glob(f"{images_dir}/*.jpg")
@@ -442,17 +552,17 @@ async def parse_pdf(
                                 "url": image_url
                             })
 
-                if dump_orig_pdf:
+                if request.dump_orig_pdf:
                     orig_pdf_file = f"{file_md5}_origin.pdf"
                     if os.path.exists(os.path.join(parse_dir, orig_pdf_file)):
                         data["orig_pdf_url"] = f"{base_url.rstrip('/')}/{relative_path}/{orig_pdf_file}"
 
-                if draw_layout_bbox:
+                if request.draw_layout_bbox:
                     layout_pdf_file = f"{file_md5}_layout.pdf"
                     if os.path.exists(os.path.join(parse_dir, layout_pdf_file)):
                         data["layout_pdf_url"] = f"{base_url.rstrip('/')}/{relative_path}/{layout_pdf_file}"
 
-                if draw_span_bbox:
+                if request.draw_span_bbox:
                     span_pdf_file = f"{file_md5}_span.pdf"
                     if os.path.exists(os.path.join(parse_dir, span_pdf_file)):
                         data["span_pdf_url"] = f"{base_url.rstrip('/')}/{relative_path}/{span_pdf_file}"
@@ -461,13 +571,14 @@ async def parse_pdf(
             status_code=200,
             content={
                 "status_code": 200,
-                "backend": backend,
+                "backend": request.backend,
                 "version": __version__,
                 "results": result_dict,
                 "processed_files": len(files_to_process),
                 "total_files": len(pdf_file_names),
                 "cached_files": len(pdf_file_names) - len(files_to_process),
-                "language_used": lang
+                "language_used": request.lang,
+                "source": "url"
             }
         )
     except Exception as e:
@@ -476,6 +587,7 @@ async def parse_pdf(
             status_code=500,
             content={"status_code": 500, "error": f"Failed to process file: {str(e)}"}
         )
+
 async def generate_tree_structure(output_dir: str, file_md5: str, backend: str, parse_method: str):
     """
     根据content_list.json生成树形结构文件
@@ -725,12 +837,12 @@ def main(ctx, host, port, reload, **kwargs):
     app.state.config = kwargs
 
     """启动MinerU FastAPI服务器的命令行入口"""
-    print(f"Start MinerU FastAPI Service: http://{host}:{port}")
-    print("The API documentation can be accessed at the following address:")
-    print(f"- Swagger UI: http://{host}:{port}/docs (使用本地文件)")
-    print(f"- ReDoc: http://{host}:{port}/redoc")
-    print(f"- Cleanup Status: http://{host}:{port}/cleanup/status")
-    print(f"- Manual Cleanup: http://{host}:{port}/cleanup")
+    logger.info(f"Start MinerU FastAPI Service: http://{host}:{port}")
+    logger.info("The API documentation can be accessed at the following address:")
+    logger.info(f"- Swagger UI: http://{host}:{port}/docs (使用本地文件)")
+    logger.info(f"- ReDoc: http://{host}:{port}/redoc")
+    logger.info(f"- Cleanup Status: http://{host}:{port}/cleanup/status")
+    logger.info(f"- Manual Cleanup: http://{host}:{port}/cleanup")
 
     uvicorn.run(
         "mineru.cli.fast_api:app",
